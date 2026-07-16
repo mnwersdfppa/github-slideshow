@@ -35,7 +35,7 @@ test('caps exponential backoff, applies jitter, and deduplicates failures until 
   await subject.runNow('github');
   assert.deepEqual(incidents, [{ connector: 'github' }]);
   assert.deepEqual(subject.snapshot().github, {
-    status: 'unhealthy', checkedAt: 100, latencyMs: 0, failures: 3, nextCheckAt: 126,
+    status: 'unhealthy', checkedAt: 100, latencyMs: 0, failures: 3, nextCheckAt: 125,
   });
   assert.doesNotMatch(JSON.stringify(subject.snapshot()), /super-secret-token/);
 
@@ -48,15 +48,59 @@ test('caps exponential backoff, applies jitter, and deduplicates failures until 
   assert.equal(incidents.length, 2, 'a recovered connector opens a new incident');
 });
 
-test('bounds a hung probe with an abortable timeout', async () => {
+test('bounds a hung probe and suppresses retries until it settles', async () => {
+  const finish = [];
+  let calls = 0;
   let signal;
   const subject = monitor(({ signal: value }) => {
+    calls += 1;
     signal = value;
-    return new Promise(() => {});
+    return new Promise((resolve) => finish.push(resolve));
   }, { timeoutMs: 10, setTimer: setTimeout, clearTimer: clearTimeout, random: () => 0 });
 
   await subject.runNow('github');
+  await subject.runNow('github');
+  assert.equal(calls, 1, 'a timed-out probe remains the sole in-flight request');
   assert.equal(signal.aborted, true);
+  assert.equal(subject.snapshot().github.status, 'unhealthy');
+  assert.equal(subject.snapshot().github.nextCheckAt, null);
+
+  finish[0]();
+  await new Promise((resolve) => setImmediate(resolve));
+  await subject.runNow('github');
+  assert.equal(calls, 2, 'probing resumes only after the abandoned request settles');
+  finish[1]();
+});
+
+test('rejects non-finite timeout and backoff values', () => {
+  for (const value of [NaN, Infinity]) {
+    assert.throws(() => monitor(async () => {}, { timeoutMs: value }), RangeError);
+    assert.throws(() => monitor(async () => {}, { baseBackoffMs: value }), RangeError);
+    assert.throws(() => monitor(async () => {}, { maxBackoffMs: value }), RangeError);
+  }
+});
+
+test('preserves connector state for special property names', async () => {
+  const subject = new ConnectorHealthMonitor({
+    connectors: [{ name: '__proto__', check: async () => {} }],
+    setTimer: () => 1,
+    clearTimer: () => {},
+    now: () => 100,
+  });
+  await subject.runNow('__proto__');
+  const snapshot = subject.snapshot();
+  assert.equal(Object.getPrototypeOf(snapshot), Object.prototype);
+  assert.equal(Object.hasOwn(snapshot, '__proto__'), true);
+  assert.equal(snapshot.__proto__.status, 'healthy');
+  assert.match(JSON.stringify(snapshot), /__proto__/);
+});
+
+test('swallows rejected async alert callbacks', async () => {
+  const subject = monitor(() => { throw new Error('probe failed'); }, {
+    onIncident: async () => { throw new Error('alert delivery failed'); },
+  });
+  await subject.runNow('github');
+  await new Promise((resolve) => setImmediate(resolve));
   assert.equal(subject.snapshot().github.status, 'unhealthy');
 });
 

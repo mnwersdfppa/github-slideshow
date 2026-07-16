@@ -1,0 +1,70 @@
+#!/bin/sh
+
+# Read-only OpenClaw OAuth guardian.  Token refresh and the OAuth flow belong
+# to OpenClaw; this script only decides whether an operator needs to act.
+set -eu
+
+provider=${OPENCLAW_PROVIDER_ID:-openai}
+profile=${OPENCLAW_PROFILE_ID:-openai:default}
+state_dir=${XDG_STATE_HOME:-"$HOME/.local/state"}/openclaw-oauth-guardian
+cooldown_seconds=${OPENCLAW_ALERT_COOLDOWN_SECONDS:-86400}
+mkdir -p "$state_dir"
+
+require_command() {
+  command -v "$1" >/dev/null 2>&1 || {
+    printf '%s\n' "openclaw-oauth-guardian: required command not found: $1" >&2
+    exit 127
+  }
+}
+
+require_command openclaw
+require_command jq
+
+# Health is deliberately collected once through OpenClaw's cached health
+# snapshot. Do not add --probe, channel checks, or model selection commands.
+health=$(openclaw health --json 2>/dev/null || true)
+printf '%s\n' "$health" >"$state_dir/health.json"
+
+auth=$(openclaw models auth list --provider "$provider" --json)
+status_exit=0
+status=$(openclaw models status --check --json) || status_exit=$?
+
+has_profile=$(printf '%s\n' "$auth" | jq -e --arg provider "$provider" --arg profile "$profile" '
+  .. | objects |
+  select((.provider? == $provider or .providerId? == $provider) and
+         (.id? == $profile or .profileId? == $profile))
+' >/dev/null && printf yes || printf no)
+
+# A status check can also report an ordinary expiry or transient outage. Those
+# are OpenClaw's responsibility and must not trigger an OAuth login prompt.
+permanent_rejection=$(printf '%s\n' "$status" | jq -r '.. | strings' | \
+  tr '[:upper:]' '[:lower:]' | \
+  grep -E -m1 'invalid_grant|invalid[_ -]?token|refresh[_ -]?token.*(revoked|rejected)|permanent.*(reject|fail)|reauth' \
+  >/dev/null && printf yes || printf no)
+
+incident=''
+if [ "$has_profile" = no ]; then
+  incident='missing-profile'
+elif [ "$status_exit" -ne 0 ] && [ "$permanent_rejection" = yes ]; then
+  incident='permanent-refresh-rejection'
+fi
+
+[ -n "$incident" ] || exit 0
+
+now=$(date +%s)
+stamp="$state_dir/$incident.last-alert"
+last=0
+[ -f "$stamp" ] && last=$(cat "$stamp" 2>/dev/null || printf 0)
+case $last in *[!0-9]*|'') last=0 ;; esac
+
+if [ $((now - last)) -lt "$cooldown_seconds" ]; then
+  exit 0
+fi
+
+printf '%s\n' "$now" >"$stamp"
+message="OpenClaw OAuth needs attention: $incident for $provider profile $profile. Run: openclaw models auth login --provider $provider --profile-id $profile"
+if [ -n "${OPENCLAW_ALERT_COMMAND:-}" ]; then
+  "$OPENCLAW_ALERT_COMMAND" "$message"
+else
+  printf '%s\n' "$message" >&2
+fi

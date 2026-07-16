@@ -1,42 +1,76 @@
 #!/bin/sh
 
-red=$'\e[1;31m'
-grn=$'\e[1;32m'
-end=$'\e[0m'
+# Publish the generated site without allowing credentials or remote responses to
+# reach the terminal, CI log, or process arguments.
+set -eu
+
+umask 077
 
 account='training-staging'
+repo=${1:-caption-this}
 
-if [ "$1" = "" ]
-then
-  repo="caption-this"
-else
-  repo=$1
-fi
+usage() {
+  printf '%s\n' 'Usage: script/stage [repository-name]' >&2
+  exit 64
+}
 
-# Build the site
-#
-# Generate the Jekyll site with an alterate baseurl for the intenral-only
-# staging site, but don't start a local server.
-printf "\n${grn}# Building site...\n--------------------------------------------------${end}\n"
-DISABLE_WHITELIST=1 bundle exec jekyll build --baseurl "/${account}/${repo}"
+# The repository name becomes part of a URL and is displayed in status output.
+# Restrict it to a GitHub repository slug so it cannot contain URL credentials,
+# control characters, or shell metacharacters.
+case "$repo" in
+  ''|*[!A-Za-z0-9._-]*|.*|*..*|-*|*-) usage ;;
+esac
 
-# Create a temp Git repo to push from
-#
-# 1. From the compiled Jekyll `_site` directory
-# 2. Initialize a new repo within that directory
-# 3. Add a new remote called staging that we can push to
-# 4. Add all our files
-# 5. Write a generic commit message
-printf "\n${grn}# Creating a temp Git repo...\n--------------------------------------------------${end}\n"
-cd _site && git init && git remote add staging https://ghe.io/${account}/${repo}.git && git add . && git commit -m "Staging latest changes"
+work_dir=$(mktemp -d "${TMPDIR:-/tmp}/github-slideshow-stage.XXXXXX") || {
+  printf '%s\n' 'Unable to create a secure staging directory.' >&2
+  exit 1
+}
+chmod 700 "$work_dir"
+log_file="$work_dir/automation.log"
+: >"$log_file"
+chmod 600 "$log_file"
 
-# Push the site
-#
-# Push the new `_site` temporary repo to our remote staging repo, then remove
-# the remote again to do it all over again afterwards.
-printf "\n${grn}# Publishing...\n--------------------------------------------------${end}\n"
-git push staging master:gh-pages --force && git remote rm staging
+cleanup() {
+  rm -f "$log_file"
+  rm -rf "$work_dir"
+}
+trap cleanup EXIT HUP INT TERM
 
-# Celebrate and open the staging site
-printf "\n${grn}# Success!${end}\n"
-open https://pages.ghe.io/${account}/${repo}/
+fail() {
+  # Command output can include credentials supplied by a proxy, remote, or
+  # credential helper. Keep it in a 0600, short-lived file and only emit a
+  # classified error to the caller.
+  printf '%s\n' "$1" >&2
+  exit "${2:-1}"
+}
+
+run() {
+  "$@" >>"$log_file" 2>&1
+}
+
+# Explicitly disable Git tracing because trace output can contain headers and
+# credential-helper exchanges. Authentication must come from Git's configured
+# credential manager, an SSH agent, or a CI secret integration -- never argv or
+# the remote URL.
+unset GIT_TRACE GIT_TRACE_PACKET GIT_TRACE_CURL GIT_CURL_VERBOSE
+export GIT_TERMINAL_PROMPT=0
+
+printf '%s\n' 'Building site...'
+run bundle exec jekyll build --baseurl "/${account}/${repo}" || fail 'Build failed.'
+
+printf '%s\n' 'Preparing deployment...'
+deploy_dir="$work_dir/site"
+run cp -R _site "$deploy_dir" || fail 'Deployment setup failed.'
+run git -C "$deploy_dir" init || fail 'Deployment setup failed.'
+run git -C "$deploy_dir" config user.name 'github-slideshow automation' || fail 'Deployment setup failed.'
+run git -C "$deploy_dir" config user.email 'github-slideshow@localhost' || fail 'Deployment setup failed.'
+run git -C "$deploy_dir" remote add staging "https://ghe.io/${account}/${repo}.git" || fail 'Deployment setup failed.'
+run git -C "$deploy_dir" add --all || fail 'Deployment setup failed.'
+run git -C "$deploy_dir" commit -m 'Staging latest changes' || fail 'Deployment setup failed.'
+
+printf '%s\n' 'Publishing...'
+run git -C "$deploy_dir" push staging master:gh-pages --force || fail 'Publish failed (authentication, authorization, or network error).'
+run git -C "$deploy_dir" remote remove staging || fail 'Deployment cleanup failed.'
+
+printf '%s\n' 'Publishing completed.'
+open "https://pages.ghe.io/${account}/${repo}/" >/dev/null 2>&1 || true

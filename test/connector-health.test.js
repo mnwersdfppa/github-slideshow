@@ -139,6 +139,36 @@ test('stop ignores results and alerts from in-flight probes', async () => {
   assert.deepEqual(incidents, []);
 });
 
+test('stop clears the in-flight timeout and aborts the probe', async () => {
+  let nextTimerId = 0;
+  const timers = new Map();
+  let signal;
+  const subject = monitor(({ signal: value }) => {
+    signal = value;
+    return new Promise(() => {});
+  }, {
+    setTimer: (callback, delay) => {
+      const id = ++nextTimerId;
+      timers.set(id, { callback, delay });
+      return id;
+    },
+    clearTimer: (id) => timers.delete(id),
+  });
+
+  subject.start();
+  const kickoff = [...timers].find(([, timer]) => timer.delay === 0);
+  assert.ok(kickoff);
+  timers.delete(kickoff[0]);
+  kickoff[1].callback();
+  await Promise.resolve();
+  assert.ok([...timers.values()].some((timer) => timer.delay === 2_000));
+  subject.stop();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(signal.aborted, true);
+  assert.equal(timers.size, 0);
+  assert.equal(subject.snapshot().github.status, 'unknown');
+});
+
 test('stop clears stale in-flight guards without releasing a restarted probe', async () => {
   let nextTimerId = 0;
   const timers = new Map();

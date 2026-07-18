@@ -80,6 +80,23 @@ test('rejects non-finite timeout and backoff values', () => {
   }
 });
 
+test('rejects delays above the Node timer limit', () => {
+  const overflow = 2_147_483_648;
+  assert.throws(() => monitor(async () => {}, { timeoutMs: overflow }), RangeError);
+  assert.throws(() => monitor(async () => {}, { baseBackoffMs: overflow, maxBackoffMs: overflow }), RangeError);
+  assert.throws(() => monitor(async () => {}, { maxBackoffMs: overflow }), RangeError);
+});
+
+test('keeps full jitter within a fractional cap', async () => {
+  const subject = monitor(() => { throw new Error('probe failed'); }, {
+    baseBackoffMs: 1.5,
+    maxBackoffMs: 1.5,
+    random: () => 1,
+  });
+  await subject.runNow('github');
+  assert.equal(subject.snapshot().github.nextCheckAt, 101.5);
+});
+
 test('preserves connector state for special property names', async () => {
   const subject = new ConnectorHealthMonitor({
     connectors: [{ name: '__proto__', check: async () => {} }],

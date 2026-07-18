@@ -121,6 +121,24 @@ test('swallows rejected async alert callbacks', async () => {
   assert.equal(subject.snapshot().github.status, 'unhealthy');
 });
 
+test('stop ignores results and alerts from in-flight probes', async () => {
+  const incidents = [];
+  let rejectProbe;
+  const subject = monitor(() => new Promise((_, reject) => { rejectProbe = reject; }), {
+    onIncident: (event) => incidents.push(event),
+  });
+  subject.start();
+  const running = subject.runNow('github');
+  await Promise.resolve();
+  subject.stop();
+  rejectProbe(new Error('probe failed after stop'));
+  await running;
+  assert.deepEqual(subject.snapshot().github, {
+    status: 'unknown', checkedAt: null, latencyMs: null, failures: 0, nextCheckAt: null,
+  });
+  assert.deepEqual(incidents, []);
+});
+
 test('standard adapters require all five named read-only connector probes', () => {
   const probes = Object.fromEntries(['linear', 'github', 'dropbox', 'hubspot', 'slack'].map((name) => [name, async () => {}]));
   assert.deepEqual(standardConnectors(probes).map(({ name }) => name), Object.keys(probes));

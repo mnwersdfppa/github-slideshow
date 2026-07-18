@@ -139,6 +139,84 @@ test('stop ignores results and alerts from in-flight probes', async () => {
   assert.deepEqual(incidents, []);
 });
 
+test('stop clears stale in-flight guards without releasing a restarted probe', async () => {
+  let nextTimerId = 0;
+  const timers = new Map();
+  const finish = [];
+  let calls = 0;
+  const setTimer = (callback, delay) => {
+    const id = ++nextTimerId;
+    timers.set(id, { callback, delay });
+    return id;
+  };
+  const fire = (delay) => {
+    const entry = [...timers].find(([, timer]) => timer.delay === delay);
+    assert.ok(entry, `missing timer with delay ${delay}`);
+    timers.delete(entry[0]);
+    entry[1].callback();
+  };
+  const subject = monitor(() => {
+    calls += 1;
+    return new Promise((resolve) => finish.push(resolve));
+  }, { timeoutMs: 10, setTimer, clearTimer: (id) => timers.delete(id) });
+
+  subject.start();
+  fire(0);
+  await Promise.resolve();
+  fire(10);
+  await new Promise((resolve) => setImmediate(resolve));
+  subject.stop();
+  subject.start();
+  fire(0);
+  await Promise.resolve();
+  assert.equal(calls, 2, 'restart launches a fresh probe while the old request is abandoned');
+
+  finish[0]();
+  await new Promise((resolve) => setImmediate(resolve));
+  await subject.runNow('github');
+  assert.equal(calls, 2, 'the old completion cannot release the restarted probe guard');
+  finish[1]();
+  await new Promise((resolve) => setImmediate(resolve));
+  subject.stop();
+});
+
+test('publishes retry time when a timed-out probe settles', async () => {
+  let nextTimerId = 0;
+  const timers = new Map();
+  let finish;
+  const setTimer = (callback, delay) => {
+    const id = ++nextTimerId;
+    timers.set(id, { callback, delay });
+    return id;
+  };
+  const fire = (delay) => {
+    const entry = [...timers].find(([, timer]) => timer.delay === delay);
+    assert.ok(entry, `missing timer with delay ${delay}`);
+    timers.delete(entry[0]);
+    entry[1].callback();
+  };
+  const subject = monitor(() => new Promise((resolve) => { finish = resolve; }), {
+    timeoutMs: 10,
+    baseBackoffMs: 10,
+    maxBackoffMs: 10,
+    random: () => 0.5,
+    setTimer,
+    clearTimer: (id) => timers.delete(id),
+  });
+
+  subject.start();
+  fire(0);
+  await Promise.resolve();
+  fire(10);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(subject.snapshot().github.nextCheckAt, null);
+  finish();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(subject.snapshot().github.nextCheckAt, 105);
+  assert.ok([...timers.values()].some((timer) => timer.delay === 5));
+  subject.stop();
+});
+
 test('standard adapters require all five named read-only connector probes', () => {
   const probes = Object.fromEntries(['linear', 'github', 'dropbox', 'hubspot', 'slack'].map((name) => [name, async () => {}]));
   assert.deepEqual(standardConnectors(probes).map(({ name }) => name), Object.keys(probes));
